@@ -13,6 +13,7 @@ import shutil
 import re
 import argparse
 import datetime
+import tempfile
 import subprocess
 
 class FuncDset:
@@ -378,6 +379,116 @@ def main(argv):
                 '-interp'   , 'spline',
                 env=jfreg_env)
             assert os.path.isfile(func.base_t1)
+
+            # ####################################
+            # WARP FUNCTIONAL DATASET TO MNI SPACE
+            # ####################################
+
+            ones = None
+            ones_mni = None
+
+            try:
+                # Create a temporary, all-1 dataset for extents masking
+                ones = os.path.join(outdir, os.path.basename(func.f[:-4]) + '_ones.nii')
+                cmd('fslmaths', func.f, '-abs', '-add', str(1), '-bin', ones,
+                    '-odt', 'char', env=jfreg_env)
+                assert(os.path.isfile(ones))
+
+                # Concatenate T1 to MNI and functional base to T1 transforms to
+                # get the functional base to MNI transform
+                cmd('convert_xfm', '-omat', func.base2mni,
+                    '-concat', brain2mni, func.base2t1, env=jfreg_env)
+                assert os.path.isfile(func.base2mni)
+
+                # Create a directory for storing the functional-to-MNI
+                # transformation matrices.
+                os.makedirs(func.func2mni)
+
+                with tempfile.TemporaryDirectory(dir=outdir) as td:
+                    # Split the functional time series into individual volumes
+                    # This is necessary because applyxfm4D does not provide
+                    # control over interpolation method (nearest neighbor is
+                    # needed for extents masking)
+                    func_vol_base = os.path.join(td, 'func_vol')
+                    func_mni_base = os.path.join(td, 'func_mni')
+                    cmd('fslsplit', func.f, func_vol_base, '-t', env=jfreg_env)
+
+                    # Split the all-ones dataset into individual volumes
+                    ones_vol_base = os.path.join(td, 'ones_vol')
+                    ones_mni_base = os.path.join(td, 'ones_mni')
+                    cmd('fslsplit', ones, ones_vol_base, '-t', env=jfreg_env)
+
+                    # Loop on volumes
+                    for v in range (0, func.nvols):
+                        func_in  = os.path.join(td, '%s%04d.nii' % (func_vol_base, v))
+                        func_out = os.path.join(td, '%s%04d.nii' % (func_mni_base, v))
+                        ones_in  = os.path.join(td, '%s%04d.nii' % (ones_vol_base, v))
+                        ones_out = os.path.join(td, '%s%04d.nii' % (ones_mni_base, v))
+
+                        assert(os.path.isfile(func_in))
+                        assert(os.path.isfile(ones_in))
+                        assert(not os.path.isfile(func_out))
+                        assert(not os.path.isfile(ones_out))
+
+                        # Concatenate the functional to base transform for each
+                        # volume with the base to MNI transform to get the
+                        # functional to MNI transform for this volume
+
+                        func2base = os.path.join(func.mc_mat  , 'MAT_%04d' % v)
+                        func2mni  = os.path.join(func.func2mni, 'F2MNI_%04d' % v)
+
+                        assert(os.path.isfile(func2base))
+                        assert(not os.path.isfile(func2mni))
+
+                        cmd('convert_xfm', '-omat', func2mni,
+                            '-concat', func.base2mni, func2base,
+                            env=jfreg_env)
+
+                        assert os.path.isfile(func2mni)
+
+                        # Apply the functional to MNI transform to get the volume
+                        # in standard space
+                        # Use sync (Blackman) interpolation to match applyxfm4D
+                        cmd('flirt',
+                            '-in'         , func_in,
+                            '-ref'        , func_mni_template,
+                            '-out'        , func_out,
+                            '-applyxfm'   ,
+                            '-init'       , func2mni,
+                            '-interp'     , 'sinc',
+                            '-sincwindow' , 'blackman',
+                            env=jfreg_env)
+
+                        # Apply the functional to MNI transform to the ones
+                        # dataset to get the extents of the transform for each
+                        # volume. Use nearest neighbor interpolation.
+                        cmd('flirt',
+                            '-in'       , ones_in,
+                            '-ref'      , func_mni_template,
+                            '-out'      , ones_out,
+                            '-applyxfm' ,
+                            '-init'     , func2mni,
+                            '-interp'   , 'nearestneighbour')
+
+                    # Merge the functional data
+                    func_mni_files = ['%s%04d.nii' % (func_mni_base, v) for v in range(0, func.nvols)]
+                    cmd('fslmerge', '-t', func.mc_mni, *func_mni_files, env=jfreg_env)
+                    assert os.path.isfile(func.mc_mni)
+
+                    # Merge the ones dataset
+                    ones_mni_files = ['%s%04d.nii' % (ones_mni_base, v) for v in range(0, func.nvols)]
+                    ones_mni = ones[:-4] + '_mni.nii'
+                    cmd('fslmerge', '-t', ones_mni, *ones_mni_files, env=jfreg_env)
+
+                    # Create the extents mask
+                    cmd('fslmaths', ones_mni, '-Tmin', func.extents,
+                        '-odt', 'char', env=jfreg_env)
+
+            finally:
+                if os.path.isfile(ones):
+                    os.remove(ones)
+                if os.path.isfile(ones_mni):
+                    os.remove(ones_mni)
 
     except:
         for f in structs:
